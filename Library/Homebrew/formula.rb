@@ -1,16 +1,7 @@
 require 'download_strategy'
 require 'fileutils'
 
-class FormulaUnavailableError <RuntimeError
-  def initialize name
-    @name = name
-    super "No available formula for #{name}"
-  end
-
-  attr_reader :name
-end
-
-
+# Defines a URL and download method for a stable or HEAD build
 class SoftwareSpecification
   attr_reader :url, :specs, :using
 
@@ -55,14 +46,39 @@ class SoftwareSpecification
 end
 
 
+# Used to annotate formulae that duplicate OS X provided software
+# :provided_by_osx
+class KegOnlyReason
+  attr_reader :reason, :explanation
+
+  def initialize reason, explanation=nil
+    @reason = reason
+    @explanation = explanation
+  end
+
+  def to_s
+    if @reason == :provided_by_osx
+      <<-EOS.chomp
+Mac OS X already provides this program and installing another version in
+parallel can cause all kinds of trouble.
+
+#{@explanation}
+EOS
+    else
+      @reason
+    end
+  end
+end
+
+
 # Derive and define at least @url, see Library/Formula for examples
 class Formula
   include FileUtils
 
-  attr_reader :url, :version, :homepage, :name, :specs, :downloader
+  attr_reader :name, :path, :url, :version, :homepage, :specs, :downloader
 
   # Homebrew determines the name
-  def initialize name='__UNKNOWN__'
+  def initialize name='__UNKNOWN__', path=nil
     set_instance_variable 'homepage'
     set_instance_variable 'url'
     set_instance_variable 'head'
@@ -87,6 +103,8 @@ class Formula
     @name=name
     validate_variable :name
 
+    @path=path
+
     set_instance_variable 'version'
     @version ||= @spec_to_use.detect_version
     validate_variable :version if @version
@@ -98,13 +116,26 @@ class Formula
 
   # if the dir is there, but it's empty we consider it not installed
   def installed?
-    return prefix.children.length > 0
+    return installed_prefix.children.length > 0
   rescue
     return false
   end
 
+  def installed_prefix
+    head_prefix = HOMEBREW_CELLAR+@name+'HEAD'
+    if @version == 'HEAD' || head_prefix.directory?
+      head_prefix
+    else
+      prefix
+    end
+  end
+
   def path
-    self.class.path name
+    if @path.nil?
+      return self.class.path(name)
+    else
+      return @path
+    end
   end
 
   def prefix
@@ -208,13 +239,53 @@ class Formula
     end
   end
 
-  # we don't have a std_autotools variant because autotools is a lot less
-  # consistent and the standard parameters are more memorable
-  # really Homebrew should determine what works inside brew() then
-  # we could add --disable-dependency-tracking when it will work
+  def == b
+    name == b.name
+  end
+  def eql? b
+    self == b and self.class.equal? b.class
+  end
+  def hash
+    name.hash
+  end
+  def <=> b
+    name <=> b.name
+  end
+  def to_s
+    name
+  end
+
+  # Standard parameters for CMake builds.
+  # Using Build Type "None" tells cmake to use our CFLAGS,etc. settings.
+  # Setting it to Release would ignore our flags.
+  # Note: there isn't a std_autotools variant because autotools is a lot
+  # less consistent and the standard parameters are more memorable.
   def std_cmake_parameters
-    # The None part makes cmake use the environment's CFLAGS etc. settings
     "-DCMAKE_INSTALL_PREFIX='#{prefix}' -DCMAKE_BUILD_TYPE=None -Wno-dev"
+  end
+
+  def fails_with_llvm msg="", data=nil
+    unless (ENV['HOMEBREW_USE_LLVM'] or ARGV.include? '--use-llvm')
+      ENV.gcc_4_2 if default_cc =~ /llvm/
+      return
+    end
+
+    build = data.delete :build rescue nil
+    msg = "(No specific reason was given)" if msg.empty?
+
+    opoo "LLVM was requested, but this formula is reported as not working with LLVM:"
+    puts msg
+    puts "Tested with LLVM build #{build}" unless build == nil
+    puts
+
+    if ARGV.force?
+      puts "Continuing anyway. If this works, let us know so we can update the\n"+
+           "formula to remove the warning."
+    else
+      puts "Continuing with GCC 4.2 instead.\n"+
+           "(Use `brew install --force #{name}` to force use of LLVM.)"
+      ENV.gcc_4_2
+    end
   end
 
   def self.class_s name
@@ -230,33 +301,84 @@ class Formula
 
   # an array of all Formula, instantiated
   def self.all
-    all = []
+    map{ |f| f }
+  end
+  def self.map
+    rv = []
+    each{ |f| rv << yield(f) }
+    rv
+  end
+  def self.each
     names.each do |n|
       begin
-        all << Formula.factory(n)
+        yield Formula.factory(n)
       rescue
-        # Don't let one broken formula break commands.
+        # Don't let one broken formula break commands. But do complain.
+        onoe "Formula #{n} will not import."
       end
     end
-    return all
+  end
+
+  def inspect
+    name
   end
 
   def self.aliases
     Dir["#{HOMEBREW_REPOSITORY}/Library/Aliases/*"].map{ |f| File.basename f }.sort
   end
 
-  def self.factory name
-    return name if name.kind_of? Formula
-    path = Pathname.new(name)
-    if path.absolute?
-      require name
-      name = path.stem
+  def self.caniconical_name name
+    formula_with_that_name = HOMEBREW_REPOSITORY+"Library/Formula/#{name}.rb"
+    possible_alias = HOMEBREW_REPOSITORY+"Library/Aliases"+name
+    if name.include? "/"
+      # Don't resolve paths or URLs
+      name
+    elsif formula_with_that_name.file? and formula_with_that_name.readable?
+      name
+    elsif possible_alias.file?
+      possible_alias.realpath.basename('.rb').to_s
     else
-      require self.path(name)
+      name
     end
+  end
+
+  def self.factory name
+    # If an instance of Formula is passed, just return it
+    return name if name.kind_of? Formula
+
+    # If a URL is passed, download to the cache and install
+    if name =~ %r[(https?|ftp)://]
+      url = name
+      name = Pathname.new(name).basename
+      target_file = (HOMEBREW_CACHE+"Formula"+name)
+      name = name.basename(".rb").to_s
+
+      (HOMEBREW_CACHE+"Formula").mkpath
+      FileUtils.rm target_file, :force => true
+      curl url, '-o', target_file
+
+      require target_file
+      install_type = :from_url
+    else
+      # Check if this is a name or pathname
+      if name.include? "/"
+        # For paths, just require the path
+        require name
+        path = Pathname.new(name)
+        name = path.stem
+        install_type = :from_path
+        target_file = path.to_s
+      else
+        name = Formula.caniconical_name(name)
+        # For names, map to the path and then require
+        require Formula.path(name)
+        install_type = :from_name
+      end
+    end
+
     begin
       klass_name = self.class_s(name)
-      klass = eval(klass_name)
+      klass = Object.const_get klass_name
     rescue NameError
       # TODO really this text should be encoded into the exception
       # and only shown if the UI deems it correct to show it
@@ -264,7 +386,9 @@ class Formula
       puts "Double-check the name of the class in that formula."
       raise LoadError
     end
-    return klass.new(name)
+
+    return klass.new(name) if install_type == :from_name
+    return klass.new(name, target_file)
   rescue LoadError
     raise FormulaUnavailableError.new(name)
   end
@@ -278,27 +402,19 @@ class Formula
   end
 
   def external_deps
-    self.class.external_deps
+    self.class.external_deps or {}
   end
 
-  def fails_with_llvm msg="", data=nil
-    return unless (ENV['HOMEBREW_USE_LLVM'] or ARGV.include? '--use-llvm')
+  # deps are in an installable order
+  # which means if a depends on b then b will be ordered before a in this list
+  def recursive_deps
+    Formula.expand_deps(self).flatten.uniq
+  end
 
-    build = data.delete :build rescue nil
-    msg = "(No specific reason was given)" if msg.empty?
-
-    opoo "LLVM was requested, but this formula is reported as not working with LLVM:"
-    puts msg
-    puts "Tested with LLVM build #{build}" unless build == nil
-    puts
-
-    if ARGV.force?
-      puts "Continuing anyway. If this works, let us know so we can update the\n"+
-           "formula to remove the warning."
-    else
-      puts "Continuing with GCC 4.2 instead.\n"+
-           "(Use `brew install --force ...` to force use of LLVM.)"
-      ENV.gcc_4_2
+  def self.expand_deps f
+    f.deps.map do |dep|
+      dep = Formula.factory dep
+      expand_deps(dep) << dep
     end
   end
 
@@ -328,11 +444,8 @@ protected
         raise
       end
     end
-  rescue SystemCallError
-    # usually because exec could not be find the command that was requested
-    raise
   rescue
-    raise BuildError.new(cmd, args, $?)
+    raise BuildError.new(self, cmd, args, $?)
   end
 
 private
@@ -444,8 +557,9 @@ EOF
     return if patch_list.empty?
 
     ohai "Downloading patches"
-    # downloading all at once is much more efficient, espeically for FTP
-    curl *(patch_list.collect{|p| p[:curl_args]}.select{|p| p}.flatten)
+    # downloading all at once is much more efficient, especially for FTP
+    patches = patch_list.collect{|p| p[:curl_args]}.select{|p| p}.flatten
+    curl(*patches)
 
     ohai "Patching"
     patch_list.each do |p|
@@ -491,7 +605,7 @@ EOF
 
     attr_rw :version, :homepage, :specs, :deps, :external_deps
     attr_rw :keg_only_reason, :skip_clean_all
-    attr_rw *CHECKSUM_TYPES
+    attr_rw(*CHECKSUM_TYPES)
 
     def head val=nil, specs=nil
       return @head if val.nil?
@@ -519,8 +633,10 @@ EOF
         case value
         when :python, :perl, :ruby, :jruby
           @external_deps[value] << key
-        when :optional, :recommended
+        when :optional, :recommended, :build
           @deps << key
+        else
+          raise "Unsupported dependency type #{value}"
         end
       when Symbol
         opoo "#{self.name} -- #{name}: Using symbols for deps is deprecated; use a string instead"
@@ -560,23 +676,23 @@ EOF
       puts "detected as an alias for the target formula."
     end
 
-    def keg_only reason
-      @keg_only_reason = reason
+    def keg_only reason, explanation=nil
+      @keg_only_reason = KegOnlyReason.new(reason, explanation.to_s.chomp)
     end
   end
 end
 
 # see ack.rb for an example usage
-class ScriptFileFormula <Formula
+class ScriptFileFormula < Formula
   def install
     bin.install Dir['*']
   end
 end
 
 # see flac.rb for example usage
-class GithubGistFormula <ScriptFileFormula
-  def initialize name='__UNKNOWN__'
-    super name
+class GithubGistFormula < ScriptFileFormula
+  def initialize name='__UNKNOWN__', path=nil
+    super name, path
     @version=File.basename(File.dirname(url))[0,6]
   end
 end

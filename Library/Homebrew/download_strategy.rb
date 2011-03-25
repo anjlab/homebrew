@@ -24,7 +24,7 @@ class AbstractDownloadStrategy
   end
 
   def quiet_safe_system *args
-    safe_system *expand_safe_system_args(args)
+    safe_system(*expand_safe_system_args(args))
   end
 end
 
@@ -145,8 +145,7 @@ end
 
 # This Download Strategy is provided for use with sites that
 # only provide HTTPS and also have a broken cert.
-# Try not to need this, as we probably won't accept the forulae
-# into trunk.
+# Try not to need this, as we probably won't accept the formula.
 class CurlUnsafeDownloadStrategy <CurlDownloadStrategy
   def _fetch
     curl @url, '--insecure', '-o', @tarball_path
@@ -165,6 +164,7 @@ class SubversionDownloadStrategy <AbstractDownloadStrategy
   end
 
   def fetch
+    @url.sub!(/^svn\+/, '') if @url =~ %r[^svn\+http://]
     ohai "Checking out #{@url}"
     if @spec == :revision
       fetch_repo @co, @url, @ref
@@ -193,7 +193,7 @@ class SubversionDownloadStrategy <AbstractDownloadStrategy
 
   def get_externals
     `'#{shell_quote(svn)}' propget svn:externals '#{shell_quote(@url)}'`.chomp.each_line do |line|
-      name, url = line.split /\s+/
+      name, url = line.split(/\s+/)
       yield name, url
     end
   end
@@ -210,7 +210,7 @@ class SubversionDownloadStrategy <AbstractDownloadStrategy
     args = _fetch_command svncommand, url, target
     args << '-r' << revision if revision
     args << '--ignore-externals' if ignore_externals
-    quiet_safe_system *args
+    quiet_safe_system(*args)
   end
 
   # Try HOMEBREW_SVN, a Homebrew-built svn, and finally the OS X system svn.
@@ -251,6 +251,10 @@ class GitDownloadStrategy <AbstractDownloadStrategy
     @clone
   end
 
+  def support_depth?
+    @url =~ %r(git://) or @url =~ %r(https://github.com/)
+  end
+
   def fetch
     raise "You must install Git:\n\n"+
           "  brew install git\n" \
@@ -269,7 +273,11 @@ class GitDownloadStrategy <AbstractDownloadStrategy
     end
 
     unless @clone.exist?
-      safe_system 'git', 'clone', @url, @clone # indeed, leave it verbose
+      # Note: first-time checkouts are always done verbosely
+      git_args = %w(git clone)
+      git_args << "--depth" << "1" if support_depth?
+      git_args << @url << @clone
+      safe_system *git_args
     else
       puts "Updating #{@clone}"
       Dir.chdir(@clone) do
@@ -365,11 +373,7 @@ class MercurialDownloadStrategy <AbstractDownloadStrategy
   def cached_location; @clone; end
 
   def fetch
-    raise "You must install mercurial, there are two options:\n\n"+
-          "    brew install pip && pip install mercurial\n"+
-          "    easy_install mercurial\n\n"+
-          "Homebrew recommends pip over the OS X provided easy_install." \
-          unless system "/usr/bin/which hg"
+    raise "You must `easy_install mercurial'" unless system "/usr/bin/which hg"
 
     ohai "Cloning #{@url}"
 
@@ -439,6 +443,39 @@ class BazaarDownloadStrategy <AbstractDownloadStrategy
   end
 end
 
+class FossilDownloadStrategy < AbstractDownloadStrategy
+  def initialize url, name, version, specs
+    super
+    @unique_token="#{name}--fossil" unless name.to_s.empty? or name == '__UNKNOWN__'
+    @clone=HOMEBREW_CACHE+@unique_token
+  end
+
+  def cached_location; @clone; end
+
+  def fetch
+    raise "You must install fossil first" \
+          unless system "/usr/bin/which fossil"
+
+    ohai "Cloning #{@url}"
+    unless @clone.exist?
+      url=@url.sub(%r[^fossil://], '')
+      safe_system 'fossil', 'clone', url, @clone
+    else
+      puts "Updating #{@clone}"
+      safe_system 'fossil', 'pull', '-R', @clone
+    end
+  end
+
+  def stage
+    # TODO: The 'open' and 'checkout' commands are very noisy and have no '-q' option.
+    safe_system 'fossil', 'open', @clone
+    if @spec and @ref
+      ohai "Checking out #{@spec} #{@ref}"
+      safe_system 'fossil', 'checkout', @ref
+    end
+  end
+end
+
 def detect_download_strategy url
   case url
     # We use a special URL pattern for cvs
@@ -448,7 +485,8 @@ def detect_download_strategy url
   when %r[^git://] then GitDownloadStrategy
   when %r[^hg://] then MercurialDownloadStrategy
   when %r[^svn://] then SubversionDownloadStrategy
-  when %r[^svn+http://] then SubversionDownloadStrategy
+  when %r[^svn\+http://] then SubversionDownloadStrategy
+  when %r[^fossil://] then FossilDownloadStrategy
     # Some well-known source hosts
   when %r[^http://github\.com/.+\.git$] then GitDownloadStrategy
   when %r[^https?://(.+?\.)?googlecode\.com/hg] then MercurialDownloadStrategy

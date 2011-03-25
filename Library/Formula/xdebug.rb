@@ -1,13 +1,13 @@
 require 'formula'
 
-class Xdebug <Formula
+class Xdebug < Formula
   url 'http://xdebug.org/files/xdebug-2.1.0.tgz'
   homepage 'http://xdebug.org'
   md5 '2abf000f8d94af469773b31772aa96ab'
 
   def install
     Dir.chdir "xdebug-#{version}" do
-      # See http://github.com/mxcl/homebrew/issues/#issue/69
+      # See https://github.com/mxcl/homebrew/issues/issue/69
       ENV.universal_binary unless Hardware.is_64_bit?
 
       system "phpize"
